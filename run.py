@@ -2,7 +2,6 @@ import ccxt
 import time
 import pandas as pd
 import numpy as np
-from typing import Tuple
 from dotenv import load_dotenv
 import os
 
@@ -64,10 +63,14 @@ bitget = ccxt.bitget({
     'enableRateLimit': True,
 })
 
-# For demo mode (only supported for Futures), add the required header and reload markets
+# For demo mode (supported only for Futures), add the required headers and reload markets.
 if use_demo and trade_type == "futures":
-    bitget.headers = {"X-Bitget-Environment": "demo"}
-    bitget.load_markets()  # Force reloading market info with the demo header
+    # Include both the demo environment and paptrading parameters.
+    bitget.headers = {
+        "X-Bitget-Environment": "demo",
+        "paptrading": "1"
+    }
+    bitget.load_markets()  # Reload market info with demo headers.
     print("🔄 Using Bitget DEMO environment.")
 else:
     bitget.load_markets()
@@ -101,8 +104,7 @@ def fetch_ohlcv_ccxt(symbol: str, timeframe: str = "5m", limit: int = 100) -> pd
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = df[col].astype(float)
         df["timestamp"] = df["timestamp"].astype(float)
-        df = df.sort_values("timestamp").reset_index(drop=True)
-        return df
+        return df.sort_values("timestamp").reset_index(drop=True)
     except Exception as e:
         print("❌ Error fetching OHLCV:", e)
         return pd.DataFrame()
@@ -129,14 +131,8 @@ def calculate_supertrend(df: pd.DataFrame, period=10, multiplier=1.0) -> pd.Data
     trend_series[0] = 1
     for i in range(1, len(df)):
         prev_close = df['close'].iloc[i-1]
-        if prev_close > up_series[i-1]:
-            up_series[i] = max(df['up'].iloc[i], up_series[i-1])
-        else:
-            up_series[i] = df['up'].iloc[i]
-        if prev_close < dn_series[i-1]:
-            dn_series[i] = min(df['dn'].iloc[i], dn_series[i-1])
-        else:
-            dn_series[i] = df['dn'].iloc[i]
+        up_series[i] = max(df['up'].iloc[i], up_series[i-1]) if prev_close > up_series[i-1] else df['up'].iloc[i]
+        dn_series[i] = min(df['dn'].iloc[i], dn_series[i-1]) if prev_close < dn_series[i-1] else df['dn'].iloc[i]
         if trend_series[i-1] == -1 and df['close'].iloc[i] > dn_series[i-1]:
             trend_series[i] = 1
         elif trend_series[i-1] == 1 and df['close'].iloc[i] < up_series[i-1]:
@@ -152,6 +148,9 @@ def calculate_supertrend(df: pd.DataFrame, period=10, multiplier=1.0) -> pd.Data
 #  BALANCE HELPERS
 # =========================================
 def fetch_spot_balance(coin: str) -> float:
+    # For demo mode, Spot endpoints are not available.
+    if use_demo:
+        return 0.0
     try:
         b = bitget.fetch_balance({'type': 'spot'})
         return float(b['free'].get(coin.upper(), 0.0))
@@ -159,10 +158,26 @@ def fetch_spot_balance(coin: str) -> float:
         print("❌ Spot balance error:", e)
         return 0.0
 
-def fetch_futures_balance(coin: str = "USDT"):
+def fetch_futures_balance(coin: str = "USDT") -> float:
     try:
         balance = bitget.fetch_balance({'type': 'swap'})
-        return float(balance.get('total', {}).get(coin.upper(), 0.0))
+        total_balance = None
+        # Try production fields first.
+        if 'total' in balance and coin.upper() in balance['total']:
+            total_balance = balance['total'][coin.upper()]
+        elif 'free' in balance and coin.upper() in balance['free']:
+            total_balance = balance['free'][coin.upper()]
+        # Fallback: check if demo response contains balance info inside "info" > "data"
+        if total_balance is None and 'info' in balance:
+            info = balance['info']
+            if isinstance(info, dict) and 'data' in info and isinstance(info['data'], list):
+                for acc in info['data']:
+                    if acc.get('currency', '').upper() == coin.upper():
+                        total_balance = acc.get('balance', 0.0)
+                        break
+        if total_balance is None:
+            total_balance = 0.0
+        return float(total_balance)
     except Exception as e:
         print("❌ Error fetching futures balance:", e)
         return 0.0
@@ -173,21 +188,21 @@ def fetch_futures_balance(coin: str = "USDT"):
 def place_spot_buy(symbol, cost_usd):
     try:
         params = {'quoteOrderQty': cost_usd}
-        order = bitget.create_market_buy_order(symbol, None, params=params)
-        return order
+        return bitget.create_market_buy_order(symbol, None, params=params)
     except Exception as e:
         print("❌ Error placing spot buy:", e)
         return None
 
 def place_spot_sell(symbol, amount):
     try:
-        order = bitget.create_market_sell_order(symbol, amount)
-        return order
+        return bitget.create_market_sell_order(symbol, amount)
     except Exception as e:
         print("❌ Error placing spot sell:", e)
         return None
 
 def get_spot_position_btc() -> float:
+    if use_demo:
+        return 0.0
     try:
         b = bitget.fetch_balance({'type': 'spot'})
         return float(b['free'].get('BTC', 0.0))
@@ -297,7 +312,6 @@ def parse_fill_price(order_resp) -> str:
 def manage_spot_position(signal: str):
     btc_bal = get_spot_position_btc()
     have_btc = btc_bal > 0
-
     if have_btc and signal == "SELL":
         close_res = place_spot_sell(CCXT_SYMBOL, btc_bal)
         if close_res:
@@ -312,8 +326,6 @@ def manage_spot_position(signal: str):
             print(f"Executed BUY (Spot) @ {fill_price}")
         else:
             print("Failed to BUY (Spot).")
-    else:
-        pass
 
 # =========================================
 #  STRATEGY: Futures (Hedge Mode Logic)
@@ -323,22 +335,18 @@ def manage_futures_position(signal: str):
     long_sz = pos.get("long", 0.0)
     short_sz = pos.get("short", 0.0)
     print("Fetched Futures Position:", pos)
-
     df = fetch_ohlcv_ccxt(CCXT_SYMBOL, TIMEFRAME, limit=1)
     if df.empty:
         print("No data => no futures action possible.")
         return
     price = df["close"].iloc[-1]
-
     futures_usdt = fetch_futures_balance()
     allocated_for_trade = min(allocated_usd, futures_usdt)
     if allocated_for_trade <= 0:
         print("❌ Not enough USDT in futures account to open new position.")
         return
-
     new_amt = (allocated_for_trade * LEVERAGE) / price
     action = "No Action"
-
     if signal == "BUY" and long_sz > 0:
         action = "No Action"
     elif signal == "SELL" and long_sz > 0:
@@ -379,7 +387,6 @@ def manage_futures_position(signal: str):
             print(f"✅ Opened SHORT @ {parse_fill_price(open_res)}")
         else:
             print(f"Failed to open SHORT. Response: {open_res}")
-
     global action_status
     action_status = action
 
@@ -411,38 +418,36 @@ def main():
         if trade_type == "spot":
             spot_usdt = fetch_spot_balance("USDT")
             futures_usdt = 0.0
-        else:
-            spot_usdt = fetch_spot_balance("USDT")
-            futures_usdt = fetch_futures_balance()
-
+        elif trade_type == "futures":
+            if use_demo:
+                spot_usdt = 0.0
+                futures_usdt = fetch_futures_balance()
+            else:
+                spot_usdt = fetch_spot_balance("USDT")
+                futures_usdt = fetch_futures_balance()
         df = fetch_ohlcv_ccxt(CCXT_SYMBOL, TIMEFRAME, limit=100)
         if df.empty or len(df) < SUPERTREND_PERIOD:
             print("❌ Not enough data or fetch error. Sleeping...\n")
             time.sleep(LOOP_INTERVAL)
             continue
-
         df = calculate_supertrend(df, SUPERTREND_PERIOD, SUPERTREND_MULTIPLIER)
         if "supertrend" not in df.columns:
             print("❌ Supertrend calc fail. Sleeping...\n")
             time.sleep(LOOP_INTERVAL)
             continue
-
         last_close = df["close"].iloc[-1]
         st_val = df["supertrend"].iloc[-1]
         tr_val = df["trend"].iloc[-1]
-
         if tr_val == 1:
             sentiment = "BULLISH"
             signal = "BUY"
         else:
             sentiment = "BEARISH"
             signal = "SELL"
-
         if trade_type == "spot":
             manage_spot_position(signal)
         else:
             manage_futures_position(signal)
-
         print_status_table(
             trade_type_label,
             spot_usdt,
@@ -454,7 +459,6 @@ def main():
             sentiment,
             signal
         )
-
         time.sleep(LOOP_INTERVAL)
 
 if __name__ == "__main__":
