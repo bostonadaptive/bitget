@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
 import os
+import json
 
 action_status = "No Action"
 
@@ -63,14 +64,18 @@ bitget = ccxt.bitget({
     'enableRateLimit': True,
 })
 
-# For demo mode (supported only for Futures), add the required headers and reload markets.
+# (Optional) Enable verbose mode to see raw request/response details:
+# bitget.verbose = True
+
+# For demo mode (Futures only), add required headers and reload markets.
 if use_demo and trade_type == "futures":
-    # Include both the demo environment and paptrading parameters.
     bitget.headers = {
         "X-Bitget-Environment": "demo",
-        "paptrading": "1"
+        "paptrading": "1",
+        "locale": "en-US",
+        "Content-Type": "application/json"
     }
-    bitget.load_markets()  # Reload market info with demo headers.
+    bitget.load_markets()  # Ensure these headers are used for all requests.
     print("🔄 Using Bitget DEMO environment.")
 else:
     bitget.load_markets()
@@ -145,10 +150,9 @@ def calculate_supertrend(df: pd.DataFrame, period=10, multiplier=1.0) -> pd.Data
     return df
 
 # =========================================
-#  BALANCE HELPERS
+#  SPOT BALANCE (REAL ONLY)
 # =========================================
 def fetch_spot_balance(coin: str) -> float:
-    # For demo mode, Spot endpoints are not available.
     if use_demo:
         return 0.0
     try:
@@ -158,28 +162,42 @@ def fetch_spot_balance(coin: str) -> float:
         print("❌ Spot balance error:", e)
         return 0.0
 
+# =========================================
+#  FUTURES BALANCE via GET /account/accounts
+# =========================================
 def fetch_futures_balance(coin: str = "USDT") -> float:
+    """
+    Calls Bitget's Get Account List endpoint:
+      GET /api/mix/v1/account/accounts?productType=umcbl
+    and returns the 'available' balance for the specified coin.
+    """
+    response = None
     try:
-        balance = bitget.fetch_balance({'type': 'swap'})
-        total_balance = None
-        # Try production fields first.
-        if 'total' in balance and coin.upper() in balance['total']:
-            total_balance = balance['total'][coin.upper()]
-        elif 'free' in balance and coin.upper() in balance['free']:
-            total_balance = balance['free'][coin.upper()]
-        # Fallback: check if demo response contains balance info inside "info" > "data"
-        if total_balance is None and 'info' in balance:
-            info = balance['info']
-            if isinstance(info, dict) and 'data' in info and isinstance(info['data'], list):
-                for acc in info['data']:
-                    if acc.get('currency', '').upper() == coin.upper():
-                        total_balance = acc.get('balance', 0.0)
-                        break
-        if total_balance is None:
-            total_balance = 0.0
-        return float(total_balance)
+        # Use the endpoint key expected by CCXT (the base URL is preconfigured).
+        endpoint = "account/accounts"  
+        method = "GET"
+        params = {"productType": "umcbl"}
+        response = bitget.fetch2(endpoint, 'private', method, params)
+        # If response is a string, parse it.
+        if isinstance(response, str):
+            response = json.loads(response)
+        print("Raw response from /account/accounts =>", response)
+        data = response.get("data", [])
+        if not isinstance(data, list):
+            print("Data field is not a list:", data)
+            return 0.0
+        for acc_info in data:
+            print("Processing account info:", acc_info)
+            margin_coin = acc_info.get("marginCoin", "").upper()
+            if margin_coin == coin.upper():
+                available_str = acc_info.get("available", "0")
+                return float(available_str)
+        return 0.0
+    except KeyError as ke:
+        print("KeyError encountered:", ke, "Response:", response)
+        return 0.0
     except Exception as e:
-        print("❌ Error fetching futures balance:", e)
+        print(f"❌ Error fetching futures balance via /account/accounts: {e}")
         return 0.0
 
 # =========================================
@@ -425,29 +443,35 @@ def main():
             else:
                 spot_usdt = fetch_spot_balance("USDT")
                 futures_usdt = fetch_futures_balance()
+
         df = fetch_ohlcv_ccxt(CCXT_SYMBOL, TIMEFRAME, limit=100)
         if df.empty or len(df) < SUPERTREND_PERIOD:
             print("❌ Not enough data or fetch error. Sleeping...\n")
             time.sleep(LOOP_INTERVAL)
             continue
+
         df = calculate_supertrend(df, SUPERTREND_PERIOD, SUPERTREND_MULTIPLIER)
         if "supertrend" not in df.columns:
             print("❌ Supertrend calc fail. Sleeping...\n")
             time.sleep(LOOP_INTERVAL)
             continue
+
         last_close = df["close"].iloc[-1]
         st_val = df["supertrend"].iloc[-1]
         tr_val = df["trend"].iloc[-1]
+
         if tr_val == 1:
             sentiment = "BULLISH"
             signal = "BUY"
         else:
             sentiment = "BEARISH"
             signal = "SELL"
+
         if trade_type == "spot":
             manage_spot_position(signal)
         else:
             manage_futures_position(signal)
+
         print_status_table(
             trade_type_label,
             spot_usdt,
@@ -459,6 +483,7 @@ def main():
             sentiment,
             signal
         )
+
         time.sleep(LOOP_INTERVAL)
 
 if __name__ == "__main__":
